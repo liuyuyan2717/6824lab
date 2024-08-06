@@ -4,6 +4,29 @@
 题目地址：http://nil.csail.mit.edu/6.824/2021/labs/lab-raft.html
 参考论文：http://nil.csail.mit.edu/6.824/2021/papers/raft-extended.pdf
 
+### 思路
+领导者选举过程：
+
+![img.png](img/img1.png)
+
+可能存在的日志复制情况：
+
+![img.png](img/img.png)
+
+leader会使用最后相同索引，持续覆盖每个follower的日志，直到其和自己一致。
+
+例如上图的leader会把下面2和3term的日志都删掉（覆盖）
+
+安全性的领导选举：
+
+follower只会给比自己日志新的raft投票，保证commit的不丢失。
+
+新leader可能存在老leader给的没有提交的日志，新leader不会单独去自己提交，会通过在自己任期内产生一个日志，然后前面的未提交日志随着自己任期的第一个日志提交。
+
+![img.png](img/img3.png)
+
+
+
 #### 2A:
 实现Raft领导者的选举和心跳功能。
 
