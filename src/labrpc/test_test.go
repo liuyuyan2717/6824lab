@@ -304,7 +304,7 @@ func TestConcurrentMany(t *testing.T) {
 	}
 
 	total := 0
-	for ii := 0; ii < nclients; ii++ {
+	for i := 0; i < nclients; i++ {
 		x := <-ch
 		total += x
 	}
@@ -337,7 +337,7 @@ func TestUnreliable(t *testing.T) {
 	ch := make(chan int)
 
 	nclients := 300
-	for ii := 0; ii < nclients; ii++ {
+	for i := 0; i < nclients; i++ {
 		go func(i int) {
 			n := 0
 			defer func() { ch <- n }()
