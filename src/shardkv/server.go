@@ -12,66 +12,78 @@ import (
 	"time"
 )
 
+// ShardKV represents a sharded key-value store server
+// It manages multiple shards, handles client requests, and coordinates with Raft for consensus
 type ShardKV struct {
-	mu      sync.RWMutex
-	dead    int32
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	mu      sync.RWMutex           // Protects concurrent access to server state
+	dead    int32                  // Atomic flag indicating if server is dead
+	rf      *raft.Raft             // Raft consensus module
+	applyCh chan raft.ApplyMsg     // Channel for receiving committed Raft entries
 
-	makeEnd func(string) *labrpc.ClientEnd
-	gid     int
-	sc      *shardctrler.Clerk
+	makeEnd func(string) *labrpc.ClientEnd // Function to create RPC endpoints to other servers
+	gid     int                            // Group ID this server belongs to
+	sc      *shardctrler.Clerk             // Client to shard controller for configuration queries
 
-	maxRaftState int // snapshot if log grows this big
-	lastApplied  int // record the lastApplied to prevent stateMachine from rollback
+	maxRaftState int // Threshold for taking snapshots (log compaction)
+	lastApplied  int // Index of last applied Raft entry (prevents state machine rollback)
 
-	lastConfig    shardctrler.Config
-	currentConfig shardctrler.Config
+	lastConfig    shardctrler.Config // Previous configuration (for migration detection)
+	currentConfig shardctrler.Config // Current configuration mapping shards to groups
 
-	stateMachines  map[int]*Shard                // KV stateMachines
-	lastOperations map[int64]OperationContext    // determine whether log is duplicated by recording the last commandId and response corresponding to the clientId
-	notifyChans    map[int]chan *CommandResponse // notify client goroutine by applier goroutine to response
+	stateMachines  map[int]*Shard                // Key-value state machines for each shard
+	lastOperations map[int64]OperationContext    // Client operation history for deduplication
+	notifyChans    map[int]chan *CommandResponse // Channels to notify waiting client requests of results
 }
 
+// Command handles client requests (Put/Append/Get)
+// This is the RPC handler that clients call directly
 func (kv *ShardKV) Command(request *CommandRequest, response *CommandResponse) {
 	kv.mu.RLock()
-	// return result directly without raft layer's participation if request is duplicated
+	// Check for duplicate non-Get requests (idempotency)
+	// Get operations are idempotent and don't need deduplication
 	if request.Op != OpGet && kv.isDuplicateRequest(request.ClientId, request.CommandId) {
 		lastResponse := kv.lastOperations[request.ClientId].LastResponse
 		response.Value, response.Err = lastResponse.Value, lastResponse.Err
 		kv.mu.RUnlock()
 		return
 	}
-	// return ErrWrongGroup directly to let client fetch latest configuration and perform a retry if this key can't be served by this shard at present
+	// Check if this server can serve the key's shard
+	// If not, tell client to fetch updated configuration
 	if !kv.canServe(key2shard(request.Key)) {
 		response.Err = ErrWrongGroup
 		kv.mu.RUnlock()
 		return
 	}
 	kv.mu.RUnlock()
+	// Forward valid request to Raft for consensus
 	kv.Execute(NewOperationCommand(request), response)
 }
 
+// Execute submits a command to Raft and waits for it to be committed/applied
+// This method handles the consensus protocol for client operations
 func (kv *ShardKV) Execute(command Command, response *CommandResponse) {
-	// do not hold lock to improve throughput
-	// when KVServer holds the lock to take snapshot, underlying raft can still commit raft logs
+	// Start command in Raft (don't hold lock to avoid blocking snapshot operations)
 	index, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		response.Err = ErrWrongLeader
 		return
 	}
 	defer DPrintf("{Node %v}{Group %v} processes Command %v with CommandResponse %v", kv.rf.Me(), kv.gid, command, response)
+	
+	// Create a notification channel for this command index
 	kv.mu.Lock()
 	ch := kv.getNotifyChan(index)
 	kv.mu.Unlock()
+	
+	// Wait for command to be applied or timeout
 	select {
 	case result := <-ch:
 		response.Value, response.Err = result.Value, result.Err
 	case <-time.After(ExecuteTimeout):
 		response.Err = ErrTimeout
 	}
-	// release notifyChan to reduce memory footprint
-	// why asynchronously? to improve throughput, here is no need to block client request
+	
+	// Clean up notification channel asynchronously to avoid blocking client
 	go func() {
 		kv.mu.Lock()
 		kv.removeOutdatedNotifyChan(index)
@@ -79,8 +91,10 @@ func (kv *ShardKV) Execute(command Command, response *CommandResponse) {
 	}()
 }
 
+// GetShardsData handles requests from other groups to pull shard data during migration
+// This is called when a group needs to pull shards that have been assigned to it
 func (kv *ShardKV) GetShardsData(request *ShardOperationRequest, response *ShardOperationResponse) {
-	// only pull shards from leader
+	// Only leaders can respond to shard data requests
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		response.Err = ErrWrongLeader
 		return
@@ -89,11 +103,13 @@ func (kv *ShardKV) GetShardsData(request *ShardOperationRequest, response *Shard
 	defer kv.mu.RUnlock()
 	defer DPrintf("{Node %v}{Group %v} processes PullTaskRequest %v with response %v", kv.rf.Me(), kv.gid, request, response)
 
+	// Check if our configuration is up-to-date enough to serve this request
 	if kv.currentConfig.Num < request.ConfigNum {
 		response.Err = ErrNotReady
 		return
 	}
 
+	// Copy requested shard data
 	response.Shards = make(map[int]map[string]string)
 	for _, shardID := range request.ShardIDs {
 		response.Shards[shardID] = kv.stateMachines[shardID].deepCopy()
@@ -157,15 +173,22 @@ func (kv *ShardKV) killed() bool {
 	return atomic.LoadInt32(&kv.dead) == 1
 }
 
-// a dedicated applier goroutine to apply committed entries to stateMachine, take snapshot and apply snapshot from raft
+// applier is a dedicated goroutine that applies committed Raft entries to the state machine
+// It handles:
+// 1. Applying operations (Put/Append/Get)
+// 2. Applying configuration changes
+// 3. Applying shard migration operations
+// 4. Taking and restoring snapshots
 func (kv *ShardKV) applier() {
 	for kv.killed() == false {
 		select {
 		case message := <-kv.applyCh:
 			DPrintf("{Node %v}{Group %v} tries to apply message %v", kv.rf.Me(), kv.gid, message)
 			if message.CommandValid {
+				// Handle committed command
 				kv.mu.Lock()
 				if message.CommandIndex <= kv.lastApplied {
+					// Skip outdated entries (may happen after snapshot restore)
 					DPrintf("{Node %v}{Group %v} discards outdated message %v because a newer snapshot which lastApplied is %v has been restored", kv.rf.Me(), kv.gid, message, kv.lastApplied)
 					kv.mu.Unlock()
 					continue
@@ -174,6 +197,7 @@ func (kv *ShardKV) applier() {
 
 				var response *CommandResponse
 				command := message.Command.(Command)
+				// Apply different types of commands
 				switch command.Op {
 				case Operation:
 					operation := command.Data.(CommandRequest)
@@ -191,18 +215,20 @@ func (kv *ShardKV) applier() {
 					response = kv.applyEmptyEntry()
 				}
 
-				// only notify related channel for currentTerm's log when node is leader
+				// Notify waiting client if this node is still leader for this term
 				if currentTerm, isLeader := kv.rf.GetState(); isLeader && message.CommandTerm == currentTerm {
 					ch := kv.getNotifyChan(message.CommandIndex)
 					ch <- response
 				}
 
+				// Check if we need to take a snapshot (log compaction)
 				needSnapshot := kv.needSnapshot()
 				if needSnapshot {
 					kv.takeSnapshot(message.CommandIndex)
 				}
 				kv.mu.Unlock()
 			} else if message.SnapshotValid {
+				// Handle snapshot installation
 				kv.mu.Lock()
 				if kv.rf.CondInstallSnapshot(message.SnapshotTerm, message.SnapshotIndex, message.Snapshot) {
 					kv.restoreSnapshot(message.Snapshot)
